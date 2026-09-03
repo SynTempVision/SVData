@@ -93,7 +93,7 @@ when combined with `ORDER BY`).
 **The fix this tool uses**: query `scene_data` first (`scene_id` is
 indexed there) to get the small set of relevant `scene_data_id` values,
 then query `image_data` by `scene_data_id` (also indexed) instead of by
-`scene_id` directly. See `REBUILD_PROMPT.md`'s "Query performance"
+`scene_id` directly. See `AI_REBUILD_PROMPT.md`'s "Query performance"
 section for the full implementation detail. Confirmed real timing:
 ~2-3 seconds total this way, vs. minutes/hung going directly at
 `image_data`.

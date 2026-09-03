@@ -13,7 +13,7 @@ PNGs, reusing the existing, already-tested decode/render pipeline in
 `scansceneAnaylze/view_blob.py` rather than duplicating it.
 
 See `DATASHEET.md` for the DB schema this tool depends on, and
-`CHANGELOG.md` for version history. `REBUILD_PROMPT.md` is a full spec an
+`CHANGELOG.md` for version history. `AI_REBUILD_PROMPT.md` is a full spec an
 AI assistant can rebuild this tool from scratch from if the source is ever
 lost.
 
