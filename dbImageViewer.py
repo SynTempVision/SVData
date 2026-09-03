@@ -119,25 +119,87 @@ def fetch_and_save(conn, system_id, camera_name, db_ip, scene_id, scene_name, si
     exactly (what the coworker's downstream tool consumes) - only the
     outer <label> folder name itself is customized (IP_sceneid_iteration)
     since that's just for our own traceability, not read by that tool."""
-    where = "scene_id = %s AND captured_dt >= %s"
-    params = [scene_id, since_dt]
+    log(f"Querying database for system {system_id} / scene {scene_id}...")
+
+    # image_data has no index covering (scene_id, captured_dt), and it's a
+    # big shared table (every camera on the server, ~1.26M+ rows) - querying
+    # it directly by scene_id/captured_dt forces a full table scan that can
+    # take minutes. scene_data, however, DOES have an index on scene_id, and
+    # image_data has an existing index on scene_data_id - so route through
+    # scene_data first (cheap, indexed) to get the small set of
+    # scene_data_id values that overlap the time window, then use those
+    # against image_data's indexed scene_data_id column instead of its
+    # unindexed scene_id/captured_dt. Confirmed on real data 2026-09-03:
+    # ~2-3s for the scene_data step + <0.1s for the image_data step, vs.
+    # 3-5+ minutes (or worse) going directly at image_data.
+    # Uses end_dt (not start_dt) so a session that started before the
+    # window but was still capturing into it isn't missed.
+    scene_where = "scene_id = %s AND end_dt >= %s"
+    scene_params = [scene_id, since_dt]
+    if until_dt:
+        scene_where += " AND start_dt <= %s"
+        scene_params.append(until_dt)
+
+    with conn.cursor(pymysql.cursors.DictCursor) as cur:
+        cur.execute(
+            f"SELECT scene_data_id FROM scene_data WHERE {scene_where}",
+            scene_params,
+        )
+        scene_data_ids = [r["scene_data_id"] for r in cur.fetchall()]
+
+    if not scene_data_ids:
+        log(f"No scene_data sessions found for system {system_id} / scene {scene_id} in that range.")
+        return 0
+
+    # image_data.captured_dt is still applied here (not just scene_data's
+    # coarser start/end bounds) as a correctness backstop, in case a
+    # session's images don't line up exactly with its recorded start/end.
+    where = "captured_dt >= %s"
+    params = [since_dt]
     if until_dt:
         where += " AND captured_dt <= %s"
         params.append(until_dt)
 
+    ID_BATCH_SIZE = 200
+    light_rows = []
     with conn.cursor(pymysql.cursors.DictCursor) as cur:
-        cur.execute(
-            f"SELECT image_data_id, image_id, captured_dt, HEX(img1) AS img1_hex "
-            f"FROM image_data WHERE {where} AND img1 IS NOT NULL ORDER BY captured_dt",
-            params,
-        )
-        rows = cur.fetchall()
+        for i in range(0, len(scene_data_ids), ID_BATCH_SIZE):
+            batch = scene_data_ids[i:i + ID_BATCH_SIZE]
+            placeholders = ",".join(["%s"] * len(batch))
+            cur.execute(
+                f"SELECT image_data_id, image_id, captured_dt FROM image_data "
+                f"WHERE scene_data_id IN ({placeholders}) AND {where} AND img1 IS NOT NULL",
+                batch + params,
+            )
+            light_rows.extend(cur.fetchall())
 
-    if not rows:
+    if not light_rows:
         log(f"No image_data rows found for system {system_id} / scene {scene_id} in that range.")
         return 0
 
-    log(f"Found {len(rows)} row(s).")
+    light_rows.sort(key=lambda r: r["captured_dt"])
+    log(f"Found {len(light_rows)} row(s). Fetching image data...")
+
+    BLOB_BATCH_SIZE = 200
+    ids = [r["image_data_id"] for r in light_rows]
+    blob_by_id = {}
+    with conn.cursor(pymysql.cursors.DictCursor) as cur:
+        for i in range(0, len(ids), BLOB_BATCH_SIZE):
+            batch_ids = ids[i:i + BLOB_BATCH_SIZE]
+            placeholders = ",".join(["%s"] * len(batch_ids))
+            cur.execute(
+                f"SELECT image_data_id, HEX(img1) AS img1_hex FROM image_data "
+                f"WHERE image_data_id IN ({placeholders})",
+                batch_ids,
+            )
+            for r in cur.fetchall():
+                blob_by_id[r["image_data_id"]] = r["img1_hex"]
+            log(f"  fetched {min(i + BLOB_BATCH_SIZE, len(ids))}/{len(ids)}")
+
+    rows = [
+        {**r, "img1_hex": blob_by_id.get(r["image_data_id"])}
+        for r in light_rows
+    ]
 
     # Each download gets its own numbered folder - never reuses an existing
     # one, so nothing ever needs merging and a second download for the same

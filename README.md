@@ -1,67 +1,80 @@
-# dbImageViewer
+# SynTemp Vision Data Viewer (SVData)
 
+A Windows GUI tool that connects directly (via `pymysql`, no SSH/mysqldump)
+to a **shared server database** where many cameras' rows are all populated
+into the same tables (`system_setup`, `scene_setup`, `image_data`,
+`scene_data`), distinguished by `system_id`/`scene_id` - as opposed to the
+older per-camera tool (`scansceneAnaylze/scandb_dump_gui.py` /
+`ScanDBDumpTool.exe`), which SSHes into one camera's own local `scandb`.
 
+Picks a camera (system) -> picks a scene on that camera -> picks a time
+range -> pulls the thermal image blobs for that scene and renders them to
+PNGs, reusing the existing, already-tested decode/render pipeline in
+`scansceneAnaylze/view_blob.py` rather than duplicating it.
 
+See `DATASHEET.md` for the DB schema this tool depends on, and
+`CHANGELOG.md` for version history. `REBUILD_PROMPT.md` is a full spec an
+AI assistant can rebuild this tool from scratch from if the source is ever
+lost.
 
-## Scope / Requirements
+## Rules
 
-1. GUI that 
-	a. Connect to a database (scandb)
-	b. query scene_id, ....
-	c. Select a time range
-	d. bring raw blobs 
-	e. ( need to organize them in a way they can be proccessed)
-		i. meaning either save the raw image name as (IP, scene_id, sceneimage_id, system_id..)
-	f. process them 
-	g. output them 
-	h. zip (optional)
-2. Part 2
-	a. based on the type of scene single image, 2x2, 3x2, whatever it is - build th eimage 
-	b. resave as a single image
-	
-## Rules:
-1. do not write to the db - never write only read
-2. phase 1 has to be complete before moving to a new phase
-3. i need to understand everything
+1. **Read-only.** Never writes to the database, only `SELECT`.
+2. Reuses `scansceneAnaylze/view_blob.py`'s decode/render pipeline rather
+   than duplicating it (`process_blob_bytes`, `write_summary_csv`).
+3. Output format for what's *inside* a label folder never changes -
+   `<label>/<timestamp>/img1_{viewable,color,color_200_600}.png` +
+   `summary.csv` - a coworker's separate downstream program consumes that
+   exact structure.
 
-## Status (2026-09-02)
+## Usage
 
-Built as `sandbox\scansceneAnaylze\server_scan_dump_gui.py`, reusing `view_blob.py`'s
-existing decode/render code rather than duplicating it.
+```
+python dbImageViewer.py
+```
 
-**Real schema confirmed against the practice server DB** (multiple cameras
-populated into one shared `scandb`):
-- `system_setup` - the systems/cameras lookup table: `system_id` (zero-padded
-  6-digit int), `camera_name`, `loc_desc`, `camera_ip`, `server_ip`,
-  `last_scene_id` (NULL if that system has never captured a scene yet). This
-  is the "friendly name" source for step 1 of the picker.
-- `scene_setup` already has `system_id` on it (same table as the per-camera
-  scandb, just many systems' rows instead of one).
-- **`system_id` and `scene_id` are independent numbering, not parallel** -
-  confirmed on real data (system_id 001020's `last_scene_id` is 1050, not
-  1020). Never assume they line up.
-- `image_data` has `scene_id` but NO `system_id` column - filtering is by
-  `scene_id` alone once a system's scene has been picked (same as the
-  per-camera tool). Scene_id numbers haven't collided across systems in the
-  data seen so far.
-- `scene_data` exists (`start_dt`/`end_dt`/`alarm`/`status`, no blobs) but
-  is NOT currently fetched by this tool - decided against it to keep the
-  output format from changing (see below).
+or run the built standalone exe (`dist/SynTempVisionDataViewer.exe`,
+built via `SynTempVisionDataViewer.spec` - see below).
 
-**Picker flow:** pick system (from `system_setup`) -> pick scene (from
-`scene_setup WHERE system_id=...`) -> pick a time range -> Download.
+1. **Connect**: database server IP, DB user (default `remote_root`), DB
+   name (default `scandb`), password.
+2. **Pick camera & scene**: System (camera) from `system_setup`, then
+   Scene from `scene_setup WHERE system_id = ...`.
+3. **Time range**: From/To calendar pickers (`ttkbootstrap.DateEntry`),
+   defaults to "yesterday through right now," hour-aligned.
+4. **Save to**: output directory, plus a zip mode - **Add zip** (keeps the
+   plain folder and adds a `.zip`) or **Zip only** (deletes the unzipped
+   folder after zipping).
+5. **Download** - runs in a background thread, Progress log shows live
+   status.
 
-**Output format - deliberately kept identical to the existing
-`output/central_1009/` example**, since a coworker's separate program
-already consumes that exact structure: `output/central_<scene_id>/
-<timestamp>/img1_{viewable,color,color_200_600}.png` + one `summary.csv`
-per label. No raw blob dump, no extra subfolders, no `scene_data.csv` -
-those were built at one point during this session and then deliberately
-removed once the "don't change the output format" constraint came up.
-Optional zip-the-output-folder checkbox added per the scope list above.
+## Output
 
-Part 2 (stitching multi-image scenes into one composite) not started -
-`stitch_scenes.py` already does this from file dumps; adapting it to the
-live-query path is the next step whenever this tool needs to handle a
-system with a multi-image scene (image_x*image_y > 1).
+```
+<out_root>/<db_server_ip>_<scene_id>_<iteration>/<timestamp>/img1_viewable.png
+<out_root>/<db_server_ip>_<scene_id>_<iteration>/<timestamp>/img1_color.png
+<out_root>/<db_server_ip>_<scene_id>_<iteration>/<timestamp>/img1_color_200_600.png
+<out_root>/<db_server_ip>_<scene_id>_<iteration>/summary.csv
+```
 
+`<iteration>` is an auto-incrementing number (`_1`, `_2`, ...) - every
+download gets its own never-reused folder, so two downloads for the same
+system/scene can never collide or overwrite each other.
+
+## Building the standalone exe
+
+```
+python -m PyInstaller --noconfirm SynTempVisionDataViewer.spec
+```
+
+Onefile build by design (portable - drop the single exe on a USB drive
+and hand it to someone with no Python install), not onedir - slower
+startup (unpacks to temp on every launch) is an accepted tradeoff for
+portability.
+
+## Dependencies
+
+`pymysql`, `ttkbootstrap` (theme + `DateEntry` widget), `pyinstaller`
+(build only). `scansceneAnaylze/view_blob.py`'s own dependencies
+(`matplotlib`, for its jet colormap) come along via the `sys.path` import.
+`tkinter` ships with Python.

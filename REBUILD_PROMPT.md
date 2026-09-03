@@ -58,6 +58,10 @@ rather than reimplementing it.
    `scansceneAnaylze/server_scan_dump_gui.py` (an earlier, untouched copy)
    even though they duplicate some code - keep them as independent plain
    files.
+6. **Never query `image_data` directly by `scene_id`/`captured_dt`.** See
+   "Query performance" section below - this is not a style preference, it's
+   the difference between a 2-3 second query and one that hangs for
+   10-25+ minutes on real production data. Route through `scene_data` first.
 
 ## Real schema (confirmed against a live practice DB)
 
@@ -82,9 +86,65 @@ rather than reimplementing it.
     a picker. Cross-check `GROUP BY scene_id` counts/`MAX(captured_dt)` in
     `image_data` against `last_scene_id` if a scene appears to have gone
     quiet.
-- `scene_data` exists (`start_dt`/`end_dt`/`alarm`/`status`, no blobs) but
-  is **not** fetched by this tool - tried during development, removed to
-  keep the output format from changing.
+- `scene_data` exists (`scene_data_id`, `scene_id`, `start_dt`/`end_dt`,
+  `alarm`, `status`, no blobs) - **is queried by this tool as of the
+  performance fix below**, but only to resolve which `scene_data_id`
+  values are relevant; its columns are never written to the output
+  (`summary.csv`/filenames are unaffected, keeping the output format
+  unchanged as originally required).
+
+## Query performance: route through `scene_data`, not `image_data` directly
+
+**Confirmed on real production data 2026-09-03** (SynTemp-LB002,
+`scandb`): `image_data` has ~1.26 million rows and its primary key is the
+*composite* `(image_data_id, scene_id)` - since `scene_id` is only the
+**second** column, BTREE indexes can only be used efficiently via their
+left-most prefix, so a query filtering `WHERE scene_id = ... AND
+captured_dt >= ...` gets **zero** benefit from that index and forces a
+full table scan + filesort (`SHOW PROCESSLIST` shows this as `Creating
+sort index`, sometimes running 10-25+ minutes or effectively hanging).
+`captured_dt` has no index anywhere.
+
+The fix: `scene_data` (a separate, similarly large table - don't assume
+it's small) **does** have a real index on `scene_id` (confirmed:
+`scan_id` index, `scene_id` as its leading column) and `image_data` has
+an *existing* index on `scene_data_id`. So the query is two steps:
+
+1. **Query `scene_data` first** (cheap, uses the real index) to get the
+   `scene_data_id` values whose session overlaps the requested window:
+   ```sql
+   SELECT scene_data_id FROM scene_data
+   WHERE scene_id = %s AND end_dt >= %s [AND start_dt <= %s]
+   ```
+   Use `end_dt >= since_dt` (not `start_dt >= since_dt`) so a session that
+   started before the window but was still capturing into it isn't
+   missed - a real correctness gap, not just style.
+2. **Query `image_data` using those `scene_data_id` values** (batched in
+   groups of ~200, via `IN (...)`) instead of `scene_id`/`captured_dt` -
+   this uses `image_data`'s existing `scene_data_id` index. Still also
+   apply the precise `captured_dt` range filter here as a correctness
+   backstop, since `scene_data`'s start/end bounds are coarser than exact
+   per-image timestamps.
+3. Fetch the actual `img1` BLOBs in a **third**, separate batched step, by
+   `image_data_id` (the primary key's leading column, confirmed fully
+   unique alone even though it's part of a composite key) - keeps the
+   expensive filter/sort steps from ever having to move large BLOB data.
+4. Sort the final small in-memory row list by `captured_dt` in Python
+   (cheap at this point) rather than asking MySQL to sort.
+
+Confirmed real timing with this approach: **~2-3 seconds total**
+(`scene_data` step dominates, since only `scene_id` is indexed there -
+`end_dt` still gets scanned within that narrowed set), vs. **3-5+ minutes,
+sometimes effectively hung indefinitely**, going directly at `image_data`.
+
+Log a line (`"Querying database..."`) *before* the first query executes,
+not after - otherwise the Progress box shows nothing at all while the
+query runs, which looks identical to a frozen/crashed app from the user's
+perspective. This was a real support incident, not a hypothetical.
+
+If you ever add a new query against `image_data`, check whether it filters
+by `scene_id` and/or `captured_dt` - if so, it needs this same two-step
+treatment or it will reintroduce the exact same multi-minute hang.
 
 ## UI flow (mirrors `scandb_dump_gui.py`'s UX patterns)
 
@@ -256,3 +316,7 @@ ships with Python.
   just `python dbImageViewer.py`) to confirm the frozen build's bundled
   ttkbootstrap theme/icon/view_blob import all actually work - the dev
   environment passing isn't sufficient proof the frozen build works.
+- Confirm the Progress log shows `"Querying database..."` immediately on
+  clicking Download, and that a real download against production-sized
+  data completes in seconds, not minutes - if it hangs, check that the
+  query is going through `scene_data` first, not `image_data` directly.
